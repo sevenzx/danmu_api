@@ -1,12 +1,143 @@
 // server.js - 智能服务器启动器：根据 Node.js 环境自动选择最优启动模式
 
 // 加载 .env 文件中的环境变量（本地开发时使用）
-try {
-  require('dotenv').config();
-  console.log('[server] .env file loaded successfully');
-} catch (e) {
-  console.log('[server] dotenv not available or .env file not found, using system environment variables');
+const path = require('path');
+const fs = require('fs');
+const dotenv = require('dotenv');
+
+// .env 文件在项目根目录（server.js 的上一级目录）
+const envPath = path.join(__dirname, '..', '.env');
+
+function loadEnv() {
+  try {
+    dotenv.config({ path: envPath, override: true });
+    console.log('[server] .env file loaded successfully');
+  } catch (e) {
+    console.log('[server] dotenv not available or .env file not found, using system environment variables');
+  }
 }
+
+// 初始加载
+loadEnv();
+
+// 监听 .env 文件变化（仅在文件存在时）
+let envWatcher = null;
+let reloadTimer = null;
+let mainServer = null;
+let proxyServer = null;
+
+function setupEnvWatcher() {
+  if (!fs.existsSync(envPath)) {
+    console.log('[server] .env file not found, skipping file watcher');
+    return;
+  }
+
+  try {
+    const chokidar = require('chokidar');
+    envWatcher = chokidar.watch(envPath, {
+      persistent: true,
+      awaitWriteFinish: {
+        stabilityThreshold: 100,
+        pollInterval: 100
+      }
+    });
+
+    envWatcher.on('change', () => {
+      // 防抖：避免短时间内多次触发
+      if (reloadTimer) {
+        clearTimeout(reloadTimer);
+      }
+
+      reloadTimer = setTimeout(() => {
+        console.log(`[server] .env file changed, reloading environment variables...`);
+
+        // 读取新的 .env 文件内容
+        try {
+          const envContent = fs.readFileSync(envPath, 'utf8');
+          const lines = envContent.split('\n');
+
+          // 解析 .env 文件中的所有键
+          const newEnvKeys = new Set();
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed && !trimmed.startsWith('#')) {
+              const match = trimmed.match(/^([^=]+)=/);
+              if (match) {
+                newEnvKeys.add(match[1]);
+              }
+            }
+          }
+
+          // 删除 process.env 中旧的键（不在新 .env 文件中的键）
+          for (const key of Object.keys(process.env)) {
+            if (!newEnvKeys.has(key)) {
+              delete process.env[key];
+            }
+          }
+
+          // 清除 dotenv 缓存并重新加载环境变量
+          delete require.cache[require.resolve('dotenv')];
+          loadEnv();
+
+          console.log('[server] Environment variables reloaded successfully');
+          console.log('[server] Updated keys:', Array.from(newEnvKeys).join(', '));
+        } catch (error) {
+          console.log('[server] Error reloading .env file:', error.message);
+        }
+
+        reloadTimer = null;
+      }, 200); // 200ms 防抖
+    });
+
+    envWatcher.on('unlink', () => {
+      console.log('[server] .env file deleted, using default environment variables');
+    });
+
+    envWatcher.on('error', (error) => {
+      console.log('[server] File watcher error:', error.message);
+    });
+
+    console.log('[server] .env file watcher started');
+  } catch (e) {
+    console.log('[server] chokidar not available, .env hot reload disabled');
+  }
+}
+
+// 优雅关闭：清理文件监听器
+function cleanupWatcher() {
+  if (envWatcher) {
+    console.log('[server] Closing file watcher...');
+    envWatcher.close();
+    envWatcher = null;
+  }
+  if (reloadTimer) {
+    clearTimeout(reloadTimer);
+    reloadTimer = null;
+  }
+  // 优雅关闭主服务器
+  if (mainServer) {
+    console.log('[server] Closing main server...');
+    mainServer.close(() => {
+      console.log('[server] Main server closed');
+    });
+  }
+  // 优雅关闭代理服务器
+  if (proxyServer) {
+    console.log('[server] Closing proxy server...');
+    proxyServer.close(() => {
+      console.log('[server] Proxy server closed');
+    });
+  }
+  // 给服务器一点时间关闭后退出
+  setTimeout(() => {
+    console.log('[server] Exit complete.');
+    process.exit(0);
+  }, 500);
+}
+
+// 监听进程退出信号
+process.on('SIGTERM', cleanupWatcher);
+process.on('SIGINT', cleanupWatcher);
 
 // 导入 ES module 兼容层（始终加载，但内部会根据需要启用）
 require('./esm-shim');
@@ -143,28 +274,53 @@ function createProxyServer() {
 
     if (queryObject.url) {
       const targetUrl = queryObject.url;
-      console.log('Target URL:', targetUrl);
+      console.log('[Proxy Server] Target URL:', targetUrl);
 
-      // 从环境变量获取代理地址
-      const proxyUrl = process.env.PROXY_URL;
-
-      const urlObj = new URL(targetUrl);
-      const options = {
-        hostname: urlObj.hostname,
-        port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
-        path: urlObj.pathname + urlObj.search,
-        method: 'GET'
+      // 从环境变量获取代理配置
+      let proxyConfig = process.env.PROXY_URL;
+      
+      const originalUrlObj = new URL(targetUrl);
+      let options = {
+        hostname: originalUrlObj.hostname,
+        port: originalUrlObj.port || (originalUrlObj.protocol === 'https:' ? 443 : 80),
+        path: originalUrlObj.pathname + originalUrlObj.search,
+        method: 'GET',
+        headers: { ...req.headers } // 传递原始请求头
       };
+      // Host 头必须被移除，以便 protocol.request 根据 options.hostname 设置正确的值
+      delete options.headers.host; 
+      
+      let protocol = originalUrlObj.protocol === 'https:' ? https : http;
 
-      // 如果设置了代理，则使用代理
-      if (proxyUrl) {
-        options.agent = new HttpsProxyAgent(proxyUrl);
-        console.log('Using proxy:', proxyUrl);
+      // 检查反代模式 (RP@)
+      if (proxyConfig && proxyConfig.startsWith("RP@")) {
+        console.log('[Proxy Server] Reverse proxy mode detected');
+        const reverseProxyUrlStr = proxyConfig.substring(3).trim().replace(/\/+$/, '');
+        
+        try {
+          const reverseUrlObj = new URL(reverseProxyUrlStr);
+          options.hostname = reverseUrlObj.hostname;
+          options.port = reverseUrlObj.port || (reverseUrlObj.protocol === 'https:' ? 443 : 80);
+          // 路径合并：/reverse/proxy/path + /original/path?query
+          options.path = (reverseUrlObj.pathname.replace(/\/$/, '')) + originalUrlObj.pathname + originalUrlObj.search;
+          protocol = reverseUrlObj.protocol === 'https:' ? https : http;
+          
+          console.log(`[Proxy Server] Rewriting to RP: ${protocol === https ? 'https' : 'http'}://${options.hostname}:${options.port}${options.path}`);
+        } catch (e) {
+          console.error('[Proxy Server] Invalid RP@ URL:', reverseProxyUrlStr, e.message);
+          res.statusCode = 500;
+          res.end('Proxy Error: Invalid Reverse Proxy URL');
+          return;
+        }
+
+      } else if (proxyConfig) {
+        // 代理模式：使用 HttpsProxyAgent
+        console.log('[Proxy Server] Using proxy agent:', proxyConfig);
+        options.agent = new HttpsProxyAgent(proxyConfig);
       } else {
-        console.log('No proxy configured, direct connection');
+        // 直连模式
+        console.log('[Proxy Server] No proxy configured, direct connection');
       }
-
-      const protocol = urlObj.protocol === 'https:' ? https : http;
 
       const proxyReq = protocol.request(options, (proxyRes) => {
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
@@ -185,20 +341,23 @@ function createProxyServer() {
   });
 }
 
+
 // --- 启动函数 ---
 // 同步启动（最优/默认路径，适用于常规已兼容环境）
 function startServerSync() {
   console.log('[server] Starting server synchronously (optimal path)');
 
+  // 设置 .env 文件监听
+  setupEnvWatcher();
+
   // 启动主业务服务器 (9321)
-  const server = createServer();
-  server.listen(9321, '0.0.0.0', () => {
+  mainServer = createServer();
+  mainServer.listen(9321, '0.0.0.0', () => {
     console.log('Server running on http://0.0.0.0:9321');
   });
 
   // 启动5321端口的代理服务
-  const proxyServer = createProxyServer();
-
+  proxyServer = createProxyServer();
   proxyServer.listen(5321, '0.0.0.0', () => {
     console.log('Proxy server running on http://0.0.0.0:5321');
   });
@@ -209,6 +368,9 @@ async function startServerAsync() {
   try {
     console.log('[server] Starting server asynchronously (compatibility mode for Node.js <20.19.0 + node-fetch v3)');
 
+    // 设置 .env 文件监听
+    setupEnvWatcher();
+
     // 预加载 node-fetch v3（解决特定环境下 node-fetch v3 的加载问题）
     if (typeof global.loadNodeFetch === 'function') {
       console.log('[server] Pre-loading node-fetch v3...');
@@ -217,14 +379,13 @@ async function startServerAsync() {
     }
 
     // 启动主业务服务器 (9321)
-    const server = createServer();
-    server.listen(9321, '0.0.0.0', () => {
+    mainServer = createServer();
+    mainServer.listen(9321, '0.0.0.0', () => {
       console.log('Server running on http://0.0.0.0:9321 (compatibility mode)');
     });
 
     // 启动5321端口的代理服务
-    const proxyServer = createProxyServer();
-
+    proxyServer = createProxyServer();
     proxyServer.listen(5321, '0.0.0.0', () => {
       console.log('Proxy server running on http://0.0.0.0:5321 (compatibility mode)');
     });
