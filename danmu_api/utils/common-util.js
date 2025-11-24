@@ -23,11 +23,14 @@ export function printFirst200Chars(data) {
   log("info", dataToPrint.slice(0, 200));  // 打印前200个字符
 }
 
-// 正则表达式：提取【】中的内容
-export const extractTitle = (title) => {
+// 正则表达式：提取episode标题中的内容
+export const extractEpisodeTitle = (title) => {
   const match = title.match(/【(.*?)】/);  // 匹配【】中的内容
   return match ? match[1] : null;  // 返回方括号中的内容，若没有匹配到，则返回null
 };
+
+// 正则表达式：提取anime标题中的内容
+export const extractAnimeTitle = (str) => str.split('(')[0].trim();
 
 // 提取年份的辅助函数
 export function extractYear(animeTitle) {
@@ -189,6 +192,17 @@ export function createDynamicPlatformOrder(preferredPlatform) {
 }
 
 /**
+ * 规范化标题中的空格（移除所有空格以便进行空格无关的匹配）
+ * @param {string} str - 输入字符串
+ * @returns {string} 规范化后的字符串（移除所有空格）
+ */
+export function normalizeSpaces(str) {
+  if (!str) return '';
+  // 移除所有空格（包括多个连续空格、制表符等）
+  return String(str).trim().replace(/\s+/g, '');
+}
+
+/**
  * 严格标题匹配函数
  * @param {string} title - 动漫标题
  * @param {string} query - 搜索关键词
@@ -197,8 +211,8 @@ export function createDynamicPlatformOrder(preferredPlatform) {
 export function strictTitleMatch(title, query) {
   if (!title || !query) return false;
 
-  const t = String(title).trim();
-  const q = String(query).trim();
+  const t = normalizeSpaces(title);
+  const q = normalizeSpaces(query);
 
   // 完全匹配
   if (t === q) return true;
@@ -222,7 +236,26 @@ export function titleMatches(title, query) {
   if (globals.strictTitleMatch) {
     return strictTitleMatch(title, query);
   } else {
-    // 宽松模糊匹配
-    return String(title).includes(String(query));
+    // 宽松模糊匹配（规范化空格后进行匹配）
+    const normalizedTitle = normalizeSpaces(title);
+    const normalizedQuery = normalizeSpaces(query);
+    return normalizedTitle.includes(normalizedQuery);
+  }
+}
+
+/**
+ * 数据类型校验
+ * @param {string} value - 值
+ * @param {string} expectedType - 期望类型
+ * @param {string} fieldName - 参数名称
+ */
+export function validateType(value, expectedType) {
+  const fieldName = value?.constructor?.name;  // 获取字段名
+  if (expectedType === "array") {
+    if (!Array.isArray(value)) {
+      throw new TypeError(`${value} 必须是一个数组，但传入的是 ${fieldName}`);
+    }
+  } else if (typeof value !== expectedType) {
+    throw new TypeError(`${value} 必须是 ${expectedType}，但传入的是 ${fieldName}`);
   }
 }

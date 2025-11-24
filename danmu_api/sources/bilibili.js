@@ -393,6 +393,12 @@ export default class BilibiliSource extends BaseSource {
   async handleAnimes(sourceAnimes, queryTitle, curAnimes) {
     const tmpAnimes = [];
 
+    // 添加错误处理，确保sourceAnimes是数组
+    if (!sourceAnimes || !Array.isArray(sourceAnimes)) {
+      log("error", "[Bilibili] sourceAnimes is not a valid array");
+      return [];
+    }
+
     const processPromises = sourceAnimes
       .filter(anime => titleMatches(anime.title, queryTitle))
       .map(async (anime) => {
@@ -422,6 +428,7 @@ export default class BilibiliSource extends BaseSource {
             episodeCount: links.length,
             rating: 0,
             isFavorited: true,
+            source: "bilibili",
           };
 
           tmpAnimes.push(transformedAnime);
@@ -632,6 +639,7 @@ export default class BilibiliSource extends BaseSource {
                 "Cookie": globals.bilibliCookie
               },
               base64Data: true,
+              retries: 1,
             });
 
             return parseDanmakuBase64(res.data);

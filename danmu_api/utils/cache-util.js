@@ -1,5 +1,8 @@
 import { globals } from '../configs/globals.js';
 import { log } from './log-util.js'
+import { Anime } from "../models/dandan-model.js";
+import { simpleHash } from "./codec-util.js";
+let fs, path;
 
 // =====================
 // cache数据结构处理函数
@@ -140,6 +143,7 @@ export function findTitleById(id) {
 
 // 添加 anime 对象到 animes，并将其 links 添加到 episodeIds
 export function addAnime(anime) {
+    anime = Anime.fromJson(anime);
     try {
         // 确保 anime 有 links 属性且是数组
         if (!anime.links || !Array.isArray(anime.links)) {
@@ -161,7 +165,7 @@ export function addAnime(anime) {
         });
 
         // 创建新的 anime 副本
-        const animeCopy = { ...anime, links: newLinks };
+        const animeCopy = Anime.fromJson({ ...anime, links: newLinks });
 
         // 检查是否已存在相同 animeId 的 anime
         const existingAnimeIndex = globals.animes.findIndex(a => a.animeId === anime.animeId);
@@ -184,7 +188,10 @@ export function addAnime(anime) {
             }
         }
 
-        log("info", `animes: ${JSON.stringify(globals.animes)}`);
+        log("info", `animes: ${JSON.stringify(
+          globals.animes,
+          (key, value) => key === 'links' ? value.length : value
+        )}`);
 
         return true;
     } catch (error) {
@@ -251,18 +258,19 @@ export function findAnimeIdByCommentId(commentId) {
   for (const anime of globals.animes) {
     for (const link of anime.links) {
       if (link.id === commentId) {
-        return anime.animeId;
+        return [anime.animeId, anime.source];
       }
     }
   }
-  return null;
+  return [null, null];
 }
 
 // 通过 animeId 查找 lastSelectMap 中 animeIds 包含该 animeId 的 key，并设置其 prefer 为 animeId
-export function setPreferByAnimeId(animeId) {
+export function setPreferByAnimeId(animeId, source) {
   for (const [key, value] of globals.lastSelectMap.entries()) {
     if (value.animeIds && value.animeIds.includes(animeId)) {
       value.prefer = animeId;
+      value.source = source;
       globals.lastSelectMap.set(key, value); // 确保更新被保存
       return key; // 返回被修改的 key
     }
@@ -274,9 +282,9 @@ export function setPreferByAnimeId(animeId) {
 export function getPreferAnimeId(title) {
   const value = globals.lastSelectMap.get(title);
   if (!value || !value.prefer) {
-    return null;
+    return [null, null];
   }
-  return value.prefer;
+  return [value.prefer, value.source];
 }
 
 // 清理所有过期的 IP 记录（超过 1 分钟没有请求的 IP）
@@ -297,5 +305,128 @@ export function cleanupExpiredIPs(currentTime) {
 
   if (cleanedCount > 0) {
     log("info", `[Rate Limit] Cleanup completed: removed ${cleanedCount} expired IP records`);
+  }
+}
+
+// 获取当前文件目录的兼容方式
+function getDirname() {
+  if (typeof __dirname !== 'undefined') {
+    // CommonJS 环境 (Vercel)
+    return __dirname;
+  }
+  // ES Module 环境 (本地)
+  // 假设 cache-util.js 在 danmu_api/utils/ 目录下
+  return path.join(process.cwd(), 'danmu_api', 'utils');
+}
+
+// 从本地缓存目录读取缓存数据
+export function readCacheFromFile(key) {
+  const cacheFilePath = path.join(getDirname(), '..', '..', '.cache', `${key}`);
+  if (fs.existsSync(cacheFilePath)) {
+    const fileContent = fs.readFileSync(cacheFilePath, 'utf8');
+    return JSON.parse(fileContent);
+  }
+  return null;
+}
+
+// 将缓存数据写入本地缓存文件
+export function writeCacheToFile(key, value) {
+  const cacheFilePath = path.join(getDirname(), '..', '..', '.cache', `${key}`);
+  fs.writeFileSync(cacheFilePath, JSON.stringify(value), 'utf8');
+}
+
+// 从本地获取缓存
+export async function getLocalCaches() {
+  if (!globals.localCacheInitialized) {
+    try {
+      log("info", 'getLocalCaches start.');
+
+      // 从本地缓存文件读取数据并恢复到 globals 中
+      globals.animes = JSON.parse(readCacheFromFile('animes')) || globals.animes;
+      globals.episodeIds = JSON.parse(readCacheFromFile('episodeIds')) || globals.episodeIds;
+      globals.episodeNum = JSON.parse(readCacheFromFile('episodeNum')) || globals.episodeNum;
+
+      // 恢复 lastSelectMap 并转换为 Map 对象
+      const lastSelectMapData = readCacheFromFile('lastSelectMap');
+      if (lastSelectMapData) {
+        globals.lastSelectMap = new Map(Object.entries(JSON.parse(lastSelectMapData)));
+        log("info", `Restored lastSelectMap from local cache with ${globals.lastSelectMap.size} entries`);
+      }
+
+      // 更新哈希值
+      globals.lastHashes.animes = simpleHash(JSON.stringify(globals.animes));
+      globals.lastHashes.episodeIds = simpleHash(JSON.stringify(globals.episodeIds));
+      globals.lastHashes.episodeNum = simpleHash(JSON.stringify(globals.episodeNum));
+      globals.lastHashes.lastSelectMap = simpleHash(JSON.stringify(Object.fromEntries(globals.lastSelectMap)));
+
+      globals.localCacheInitialized = true;
+      log("info", 'getLocalCaches completed successfully.');
+    } catch (error) {
+      log("error", `getLocalCaches failed: ${error.message}`, error.stack);
+      globals.localCacheInitialized = true; // 标记为已初始化，避免重复尝试
+    }
+  }
+}
+
+// 更新本地缓存
+export async function updateLocalCaches() {
+  try {
+    log("info", 'updateLocalCaches start.');
+    const updates = [];
+
+    // 检查每个变量的哈希值
+    const variables = [
+      { key: 'animes', value: globals.animes },
+      { key: 'episodeIds', value: globals.episodeIds },
+      { key: 'episodeNum', value: globals.episodeNum },
+      { key: 'lastSelectMap', value: globals.lastSelectMap }
+    ];
+
+    for (const { key, value } of variables) {
+      // 对于 lastSelectMap（Map 对象），需要转换为普通对象后再序列化
+      const serializedValue = key === 'lastSelectMap' ? JSON.stringify(Object.fromEntries(value)) : JSON.stringify(value);
+      const currentHash = simpleHash(serializedValue);
+      if (currentHash !== globals.lastHashes[key]) {
+        writeCacheToFile(key, serializedValue);
+        updates.push({ key, hash: currentHash });
+      }
+    }
+
+    // 输出更新日志
+    if (updates.length > 0) {
+      log("info", `Updated local caches for keys: ${updates.map(u => u.key).join(', ')}`);
+      updates.forEach(({ key, hash }) => {
+        globals.lastHashes[key] = hash; // 更新本地哈希
+      });
+    } else {
+      log("info", 'No changes detected, skipping local cache update.');
+    }
+
+  } catch (error) {
+    log("error", `updateLocalCaches failed: ${error.message}`, error.stack);
+    log("error", `Error details - Name: ${error.name}, Cause: ${error.cause ? error.cause.message : 'N/A'}`);
+  }
+}
+
+// 判断是否有效的本地缓存目录
+export async function judgeLocalCacheValid(urlPath, deployPlatform) {
+  if (deployPlatform === 'node') {
+    try {
+      fs = await import('fs');
+      path = await import('path');
+
+      if (!globals.localCacheValid && urlPath !== "/favicon.ico" && urlPath !== "/robots.txt") {
+        const cacheDirPath = path.join(getDirname(), '..', '..', '.cache');
+
+        if (fs.existsSync(cacheDirPath)) {
+          globals.localCacheValid = true;
+        } else {
+          globals.localCacheValid = false;
+        }
+      }
+    } catch (error) {
+      console.warn('Node.js modules not available:', error.message);
+      globals.localCacheValid = false;
+    }
   }
 }

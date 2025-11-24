@@ -6,7 +6,7 @@ import { generateValidStartDate } from "../utils/time-util.js";
 import { addAnime, removeEarliestAnime } from "../utils/cache-util.js";
 import { simplized, traditionalized } from "../utils/zh-util.js";
 import { getTmdbJaOriginalTitle } from "../utils/tmdb-util.js";
-import { strictTitleMatch } from "../utils/common-util.js";
+import { strictTitleMatch, normalizeSpaces } from "../utils/common-util.js";
 
 // =====================
 // 获取巴哈姆特弹幕
@@ -30,11 +30,8 @@ export default class BahamutSource extends BaseSource {
       // 第一次搜索：繁体词搜索
       const originalSearchPromise = (async () => {
         try {
-          const apiUrl = `/mobile_app/anime/v1/search.php?kw=${encodedKeyword}`;
-          const originalApiUrl = `https://api.gamer.com.tw${apiUrl}`;
-          const url = globals.proxyUrl
-            ? `http://127.0.0.1:5321/proxy?url=${encodeURIComponent(originalApiUrl)}`
-            : originalApiUrl;
+          const targetUrl = `https://api.gamer.com.tw/mobile_app/anime/v1/search.php?kw=${encodedKeyword}`;
+          const url = globals.proxyUrl ? `http://127.0.0.1:5321/proxy?url=${encodeURIComponent(targetUrl)}` : targetUrl;
           
           const originalResp = await httpGet(url, {
             headers: {
@@ -109,11 +106,8 @@ export default class BahamutSource extends BaseSource {
 
           log("info", `[Bahamut] 使用日语原名进行搜索: ${tmdbTitle}`);
           const encodedTmdbTitle = encodeURIComponent(tmdbTitle);
-          const tmdbApiUrl = `/mobile_app/anime/v1/search.php?kw=${encodedTmdbTitle}`;
-          const tmdbOriginalUrl = `https://api.gamer.com.tw${tmdbApiUrl}`;
-          const tmdbSearchUrl = globals.proxyUrl
-            ? `http://127.0.0.1:5321/proxy?url=${encodeURIComponent(tmdbOriginalUrl)}`
-            : tmdbOriginalUrl;
+          const targetUrl = `https://api.gamer.com.tw/mobile_app/anime/v1/search.php?kw=${encodedTmdbTitle}`;
+          const tmdbSearchUrl = globals.proxyUrl ? `http://127.0.0.1:5321/proxy?url=${encodeURIComponent(targetUrl)}` : targetUrl;
           
           const tmdbResp = await httpGet(tmdbSearchUrl, {
             headers: {
@@ -181,7 +175,6 @@ export default class BahamutSource extends BaseSource {
       // 构建剧集信息 URL
       const targetUrl = `https://api.gamer.com.tw/anime/v1/video.php?videoSn=${id}`;
       const url = globals.proxyUrl ? `http://127.0.0.1:5321/proxy?url=${encodeURIComponent(targetUrl)}` : targetUrl;
-      
       const resp = await httpGet(url, {
         headers: {
           "Content-Type": "application/json",
@@ -252,17 +245,21 @@ export default class BahamutSource extends BaseSource {
       }
 
       // 宽松模糊匹配模式（默认）
-      // 直接包含检查
-      if (tItem.includes(q)) return true;
-      if (used && tItem.includes(used)) return true;
+      // 规范化空格后进行直接包含检查
+      const normalizedItem = normalizeSpaces(tItem);
+      const normalizedQ = normalizeSpaces(q);
+      const normalizedUsed = used ? normalizeSpaces(used) : '';
+
+      if (normalizedItem.includes(normalizedQ)) return true;
+      if (normalizedUsed && normalizedItem.includes(normalizedUsed)) return true;
 
       // 尝试繁体/简体互转（双向匹配）
       try {
-        if (tItem.includes(traditionalized(q))) return true;
-        if (tItem.includes(simplized(q))) return true;
-        if (used) {
-          if (tItem.includes(traditionalized(used))) return true;
-          if (tItem.includes(simplized(used))) return true;
+        if (normalizedItem.includes(normalizeSpaces(traditionalized(q)))) return true;
+        if (normalizedItem.includes(normalizeSpaces(simplized(q)))) return true;
+        if (normalizedUsed) {
+          if (normalizedItem.includes(normalizeSpaces(traditionalized(used)))) return true;
+          if (normalizedItem.includes(normalizeSpaces(simplized(used)))) return true;
         }
       } catch (e) {
         // 转换过程中可能会因为异常输入而抛错；忽略继续
@@ -270,8 +267,8 @@ export default class BahamutSource extends BaseSource {
 
       // 尝试不区分大小写的拉丁字母匹配
       try {
-        if (tItem.toLowerCase().includes(q.toLowerCase())) return true;
-        if (used && tItem.toLowerCase().includes(used.toLowerCase())) return true;
+        if (normalizedItem.toLowerCase().includes(normalizedQ.toLowerCase())) return true;
+        if (normalizedUsed && normalizedItem.toLowerCase().includes(normalizedUsed.toLowerCase())) return true;
       } catch (e) { }
 
       return false;
@@ -296,49 +293,54 @@ export default class BahamutSource extends BaseSource {
 
     // 使用 map 和 async 时需要返回 Promise 数组，并等待所有 Promise 完成
     const processBahamutAnimes = await Promise.all(filtered.map(async (anime) => {
-      const epData = await this.getEpisodes(anime.video_sn);
-      const detail = epData.video;
+      try {
+        const epData = await this.getEpisodes(anime.video_sn);
+        const detail = epData.video;
 
-      // 处理 episodes 对象中的多个键（"0", "1", "2" 等）
-      // 某些内容（如电影）可能在不同的键中
-      let eps = null;
-      if (epData.anime.episodes) {
-        // 优先使用 "0" 键，如果不存在则使用第一个可用的键
-        eps = epData.anime.episodes["0"] || Object.values(epData.anime.episodes)[0];
-      }
-
-      let links = [];
-      if (eps && Array.isArray(eps)) {
-        for (const ep of eps) {
-          const epTitle = `第${ep.episode}集`;
-          links.push({
-            "name": ep.episode,
-            "url": ep.videoSn.toString(),
-            "title": `【bahamut】 ${epTitle}`
-          });
+        // 处理 episodes 对象中的多个键（"0", "1", "2" 等）
+        // 某些内容（如电影）可能在不同的键中
+        let eps = null;
+        if (epData.anime.episodes) {
+          // 优先使用 "0" 键，如果不存在则使用第一个可用的键
+          eps = epData.anime.episodes["0"] || Object.values(epData.anime.episodes)[0];
         }
-      }
 
-      if (links.length > 0) {
-        let yearMatch = (anime.info || "").match(/(\d{4})/);
-        let transformedAnime = {
-          animeId: anime.video_sn,
-          bangumiId: String(anime.video_sn),
-          animeTitle: `${simplized(anime.title)}(${(anime.info.match(/(\d{4})/) || [null])[0]})【动漫】from bahamut`,
-          type: "动漫",
-          typeDescription: "动漫",
-          imageUrl: anime.cover,
-          startDate: generateValidStartDate(new Date(epData.anime.seasonStart).getFullYear()),
-          episodeCount: links.length,
-          rating: detail.rating,
-          isFavorited: true,
-        };
+        let links = [];
+        if (eps && Array.isArray(eps)) {
+          for (const ep of eps) {
+            const epTitle = `第${ep.episode}集`;
+            links.push({
+              "name": ep.episode.toString(),
+              "url": ep.videoSn.toString(),
+              "title": `【bahamut】 ${epTitle}`
+            });
+          }
+        }
 
-        tmpAnimes.push(transformedAnime);
+        if (links.length > 0) {
+          let yearMatch = (anime.info || "").match(/(\d{4})/);
+          let transformedAnime = {
+            animeId: anime.video_sn,
+            bangumiId: String(anime.video_sn),
+            animeTitle: `${simplized(anime.title)}(${(anime.info.match(/(\d{4})/) || [null])[0]})【动漫】from bahamut`,
+            type: "动漫",
+            typeDescription: "动漫",
+            imageUrl: anime.cover,
+            startDate: generateValidStartDate(new Date(epData.anime.seasonStart).getFullYear()),
+            episodeCount: links.length,
+            rating: detail.rating,
+            isFavorited: true,
+            source: "bahamut",
+          };
 
-        addAnime({...transformedAnime, links: links});
+          tmpAnimes.push(transformedAnime);
 
-        if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
+          addAnime({...transformedAnime, links: links});
+
+          if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
+        }
+      } catch (error) {
+        log("error", `[Bahamut] Error processing anime: ${error.message}`);
       }
     }));
 
@@ -354,12 +356,12 @@ export default class BahamutSource extends BaseSource {
       // 构建弹幕 URL
       const targetUrl = `https://api.gamer.com.tw/anime/v1/danmu.php?geo=TW%2CHK&videoSn=${id}`;
       const url = globals.proxyUrl ? `http://127.0.0.1:5321/proxy?url=${encodeURIComponent(targetUrl)}` : targetUrl;
-      
       const resp = await httpGet(url, {
         headers: {
           "Content-Type": "application/json",
           "User-Agent": "Anime/2.29.2 (7N5749MM3F.tw.com.gamer.anime; build:972; iOS 26.0.0) Alamofire/5.6.4",
         },
+        retries: 1,
       });
 
       // 将当前请求的 episodes 拼接到总数组

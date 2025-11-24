@@ -207,46 +207,57 @@ export default class YoukuSource extends BaseSource {
   async handleAnimes(sourceAnimes, queryTitle, curAnimes) {
     const tmpAnimes = [];
 
+    // 添加错误处理，确保sourceAnimes是数组
+    if (!sourceAnimes || !Array.isArray(sourceAnimes)) {
+      log("error", "[Youku] sourceAnimes is not a valid array");
+      return [];
+    }
+
     const processYoukuAnimes = await Promise.all(sourceAnimes
       .filter(s => titleMatches(s.title, queryTitle))
       .map(async (anime) => {
-        const eps = await this.getEpisodes(anime.mediaId);
+        try {
+          const eps = await this.getEpisodes(anime.mediaId);
 
-        // 提取媒体类型
-        const mediaType = this._extractMediaType(anime.cats, anime.type);
+          // 提取媒体类型
+          const mediaType = this._extractMediaType(anime.cats, anime.type);
 
-        // 处理和格式化分集
-        const formattedEps = this._processAndFormatEpisodes(eps, mediaType);
+          // 处理和格式化分集
+          const formattedEps = this._processAndFormatEpisodes(eps, mediaType);
 
-        let links = [];
-        for (const ep of formattedEps) {
-          const fullUrl = ep.link || `https://v.youku.com/v_show/id_${ep.vid}.html`;
-          links.push({
-            "name": ep.episodeIndex,
-            "url": fullUrl,
-            "title": `【youku】 ${ep.title}`
-          });
-        }
+          let links = [];
+          for (const ep of formattedEps) {
+            const fullUrl = ep.link || `https://v.youku.com/v_show/id_${ep.vid}.html`;
+            links.push({
+              "name": ep.episodeIndex.toString(),
+              "url": fullUrl,
+              "title": `【youku】 ${ep.title}`
+            });
+          }
 
-        if (links.length > 0) {
-          const numericAnimeId = convertToAsciiSum(anime.mediaId);
-          let transformedAnime = {
-            animeId: numericAnimeId,
-            bangumiId: anime.mediaId,
-            animeTitle: `${anime.title}(${anime.year || 'N/A'})【${anime.type}】from youku`,
-            type: anime.type,
-            typeDescription: anime.type,
-            imageUrl: anime.imageUrl,
-            startDate: generateValidStartDate(anime.year),
-            episodeCount: links.length,
-            rating: 0,
-            isFavorited: true,
-          };
+          if (links.length > 0) {
+            const numericAnimeId = convertToAsciiSum(anime.mediaId);
+            let transformedAnime = {
+              animeId: numericAnimeId,
+              bangumiId: anime.mediaId,
+              animeTitle: `${anime.title}(${anime.year || 'N/A'})【${anime.type}】from youku`,
+              type: anime.type,
+              typeDescription: anime.type,
+              imageUrl: anime.imageUrl,
+              startDate: generateValidStartDate(anime.year),
+              episodeCount: links.length,
+              rating: 0,
+              isFavorited: true,
+              source: "youku",
+            };
 
-          tmpAnimes.push(transformedAnime);
-          addAnime({...transformedAnime, links: links});
+            tmpAnimes.push(transformedAnime);
+            addAnime({...transformedAnime, links: links});
 
-          if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
+            if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
+          }
+        } catch (error) {
+          log("error", `[Youku] Error processing anime: ${error.message}`);
         }
       })
     );
@@ -263,35 +274,6 @@ export default class YoukuSource extends BaseSource {
    */
   _processAndFormatEpisodes(rawEpisodes, mediaType = 'variety') {
     let filteredEpisodes = [...rawEpisodes];
-
-    // 综艺节目需要倒序处理
-    if (mediaType === 'variety') {
-      log("info", `[Youku] 检测到综艺节目，进行倒序处理`);
-      filteredEpisodes = filteredEpisodes.reverse();
-
-      // 检测特殊格式 "第N期：上/中/下"
-      const specialFormatPattern = /第\d+期\s*[：:]\s*[上中下]\s*[：:]/;
-      const hasSpecialFormat = filteredEpisodes.some(ep => {
-        const displayName = ep.displayName || ep.title;
-        return specialFormatPattern.test(displayName);
-      });
-
-      if (hasSpecialFormat) {
-        log("info", `[Youku] 检测到综艺特殊格式 '第N期：上/中/下'，进行智能过滤`);
-        // 只保留"上"或没有标记的分集
-        const finalFiltered = [];
-        for (const ep of filteredEpisodes) {
-          const displayName = ep.displayName || ep.title;
-          const match = displayName.match(/第(\d+)期\s*[：:]\s*([上中下])/);
-          if (!match || match[2] === '上') {
-            finalFiltered.push(ep);
-          } else {
-            log("debug", `[Youku] 过滤掉综艺分段: ${displayName}`);
-          }
-        }
-        filteredEpisodes = finalFiltered;
-      }
-    }
 
     // 格式化分集标题
     const formattedEpisodes = filteredEpisodes.map((ep, index) => {
@@ -331,9 +313,9 @@ export default class YoukuSource extends BaseSource {
     if (mediaType === 'variety') {
       const periodMatch = cleanDisplayName.match(/第(\d+)期/);
       if (periodMatch) {
-        return `第${periodMatch[1]}期`;
+        return `第${periodMatch[1]}期 ${ep.published?.split(' ')[0] ?? ''} ${cleanDisplayName}`;
       } else {
-        return `第${episodeIndex}期`;
+        return `第${episodeIndex}期 ${ep.published?.split(' ')[0] ?? ''} ${cleanDisplayName}`;
       }
     }
 
@@ -574,7 +556,8 @@ export default class YoukuSource extends BaseSource {
           "Content-Type": "application/x-www-form-urlencoded",
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
         },
-        allow_redirects: false
+        allow_redirects: false,
+        retries: 1,
       });
 
       const results = [];

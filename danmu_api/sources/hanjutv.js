@@ -135,41 +135,52 @@ export default class HanjutvSource extends BaseSource {
 
     const tmpAnimes = [];
 
+    // 添加错误处理，确保sourceAnimes是数组
+    if (!sourceAnimes || !Array.isArray(sourceAnimes)) {
+      log("error", "[Hanjutv] sourceAnimes is not a valid array");
+      return [];
+    }
+
     // 使用 map 和 async 时需要返回 Promise 数组，并等待所有 Promise 完成
     const processHanjutvAnimes = await Promise.all(sourceAnimes
       .filter(s => titleMatches(s.name, queryTitle))
       .map(async (anime) => {
-        const detail = await this.getDetail(anime.sid);
-        const eps = await this.getEpisodes(anime.sid);
-        let links = [];
-        for (const ep of eps) {
-          const epTitle = ep.title && ep.title.trim() !== "" ? `第${ep.serialNo}集：${ep.title}` : `第${ep.serialNo}集`;
-          links.push({
-            "name": ep.title,
-            "url": ep.pid,
-            "title": `【hanjutv】 ${epTitle}`
-          });
-        }
+        try {
+          const detail = await this.getDetail(anime.sid);
+          const eps = await this.getEpisodes(anime.sid);
+          let links = [];
+          for (const ep of eps) {
+            const epTitle = ep.title && ep.title.trim() !== "" ? `第${ep.serialNo}集：${ep.title}` : `第${ep.serialNo}集`;
+            links.push({
+              "name": epTitle,
+              "url": ep.pid,
+              "title": `【hanjutv】 ${epTitle}`
+            });
+          }
 
-        if (links.length > 0) {
-          let transformedAnime = {
-            animeId: anime.animeId,
-            bangumiId: String(anime.animeId),
-            animeTitle: `${anime.name}(${new Date(anime.updateTime).getFullYear()})【${getCategory(detail.category)}】from hanjutv`,
-            type: getCategory(detail.category),
-            typeDescription: getCategory(detail.category),
-            imageUrl: anime.image.thumb,
-            startDate: generateValidStartDate(new Date(anime.updateTime).getFullYear()),
-            episodeCount: links.length,
-            rating: detail.rank,
-            isFavorited: true,
-          };
+          if (links.length > 0) {
+            let transformedAnime = {
+              animeId: anime.animeId,
+              bangumiId: String(anime.animeId),
+              animeTitle: `${anime.name}(${new Date(anime.updateTime).getFullYear()})【${getCategory(detail.category)}】from hanjutv`,
+              type: getCategory(detail.category),
+              typeDescription: getCategory(detail.category),
+              imageUrl: anime.image.thumb,
+              startDate: generateValidStartDate(new Date(anime.updateTime).getFullYear()),
+              episodeCount: links.length,
+              rating: detail.rank,
+              isFavorited: true,
+              source: "hanjutv",
+            };
 
-          tmpAnimes.push(transformedAnime);
+            tmpAnimes.push(transformedAnime);
 
-          addAnime({...transformedAnime, links: links});
+            addAnime({...transformedAnime, links: links});
 
-          if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
+            if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
+          }
+        } catch (error) {
+          log("error", `[Hanjutv] Error processing anime: ${error.message}`);
         }
       })
     );
@@ -191,6 +202,7 @@ export default class HanjutvSource extends BaseSource {
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
           },
+          retries: 1,
         });
 
         // 将当前请求的 episodes 拼接到总数组
