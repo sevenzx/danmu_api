@@ -1,14 +1,39 @@
 import { globals } from '../configs/globals.js';
 import { log } from './log-util.js'
 import { jsonResponse, xmlResponse } from "./http-util.js";
+import { traditionalized } from './zh-util.js';
 
 // =====================
 // danmu处理相关函数
 // =====================
 
+/**
+ * 对弹幕进行分组、去重和计数处理
+ * @param {Array} filteredDanmus 已过滤屏蔽词的弹幕列表
+ * @param {number} n 分组时间间隔（分钟），0表示不分组（除非多源合并强制去重）
+ * @returns {Array} 处理后的弹幕列表
+ */
 export function groupDanmusByMinute(filteredDanmus, n) {
-  // 如果 n 为 0，直接返回原始数据
-  if (n === 0) {
+  // 解析弹幕来源标签以确定合并源数量，用于智能去重
+  // 检查第一条弹幕的 p 属性结尾的 [source] 标签
+  let sourceCount = 1;
+  if (filteredDanmus.length > 0 && filteredDanmus[0].p) {
+    const pStr = filteredDanmus[0].p;
+    const match = pStr.match(/\[([^\]]*)\]$/);
+    if (match && match[1]) {
+      // 支持半角 '&' 和全角 '＆' 分隔符
+      sourceCount = match[1].split(/[&＆]/).length;
+    }
+  }
+
+  // 如果检测到多源合并，输出日志提示
+  if (sourceCount > 1) {
+    log("info", `[Smart Deduplication] Detected multi-source merged danmaku (${sourceCount} sources). Applying smart count adjustment.`);
+  }
+
+  // 特殊逻辑：如果未开启分组(n=0)且为单源，直接返回原始数据
+  // 若为多源，即使n=0也强制执行精确时间点去重，以消除源之间的重复数据
+  if (n === 0 && sourceCount === 1) {
     return filteredDanmus.map(danmu => ({
       ...danmu,
       t: danmu.t !== undefined ? danmu.t : parseFloat(danmu.p.split(',')[0])
@@ -16,29 +41,30 @@ export function groupDanmusByMinute(filteredDanmus, n) {
   }
 
   // 按 n 分钟分组
-  const groupedByMinute = filteredDanmus.reduce((acc, danmu) => {
+  const groupedByTime = filteredDanmus.reduce((acc, danmu) => {
     // 获取时间：优先使用 t 字段，如果没有则使用 p 的第一个值
     const time = danmu.t !== undefined ? danmu.t : parseFloat(danmu.p.split(',')[0]);
-    // 计算分组（每 n 分钟一组，向下取整）
-    const group = Math.floor(time / (n * 60));
+    
+    // 确定分组键：n=0时使用精确时间(保留2位小数)，否则使用分钟索引
+    const groupKey = n === 0 ? time.toFixed(2) : Math.floor(time / (n * 60));
 
     // 初始化分组
-    if (!acc[group]) {
-      acc[group] = [];
+    if (!acc[groupKey]) {
+      acc[groupKey] = [];
     }
 
     // 添加到对应分组
-    acc[group].push({ ...danmu, t: time });
+    acc[groupKey].push({ ...danmu, t: time });
     return acc;
   }, {});
 
   // 处理每组的弹幕
-  const result = Object.keys(groupedByMinute).map(group => {
-    const danmus = groupedByMinute[group];
+  const result = Object.keys(groupedByTime).map(key => {
+    const danmus = groupedByTime[key];
 
     // 按消息内容分组
     const groupedByMessage = danmus.reduce((acc, danmu) => {
-      const message = danmu.m.split(' X')[0]; // 提取原始消息（去除 Xn 后缀）
+      const message = danmu.m.split(' X')[0].trim(); // 提取原始消息（去除 Xn 后缀）
       if (!acc[message]) {
         acc[message] = {
           count: 0,
@@ -56,10 +82,17 @@ export function groupDanmusByMinute(filteredDanmus, n) {
     // 转换为结果格式
     return Object.keys(groupedByMessage).map(message => {
       const data = groupedByMessage[message];
+      
+      // 计算显示计数：总次数除以源数量，四舍五入
+      // 过滤因多源合并产生的自然重复
+      let displayCount = Math.round(data.count / sourceCount);
+      if (displayCount < 1) displayCount = 1;
+
       return {
         cid: data.cid,
         p: data.p,
-        m: data.count > 1 ? `${message} x ${data.count}` : message,
+        // 仅当计算后的逻辑计数大于1时才显示 "x N"
+        m: displayCount > 1 ? `${message} x ${displayCount}` : message,
         t: data.earliestT
       };
     });
@@ -216,11 +249,11 @@ export function convertToDanmakuJson(contents, platform) {
 
   // 应用弹幕转换规则（在去重和限制弹幕数之后）
   let convertedDanmus = limitDanmusByCount(groupedDanmus, globals.danmuLimit);
-  if (globals.convertTopBottomToScroll || globals.convertColorToWhite) {
+  if (globals.convertTopBottomToScroll || globals.convertColor === 'white' || globals.convertColor === 'color') {
     let topBottomCount = 0;
     let colorCount = 0;
 
-    convertedDanmus = groupedDanmus.map(danmu => {
+    convertedDanmus = convertedDanmus.map(danmu => {
       const pValues = danmu.p.split(',');
       if (pValues.length < 3) return danmu;
 
@@ -235,10 +268,20 @@ export function convertToDanmakuJson(contents, platform) {
         modified = true;
       }
 
-      // 2. 将彩色弹幕转换为纯白弹幕
-      if (globals.convertColorToWhite && color !== 16777215) {
+      // 2. 弹幕转换颜色
+      // 2.1 将彩色弹幕转换为白色
+      if (globals.convertColor === 'white' && color !== 16777215) {
         colorCount++;
         color = 16777215;
+        modified = true;
+      }
+      // 2.2 将白色弹幕转换为随机颜色，白、红、橙、黄、绿、青、蓝、紫、粉（模拟真实情况，增加白色出现概率）
+      let colors = [16777215, 16777215, 16777215, 16777215, 16777215, 16777215, 16777215, 16777215, 
+                    16744319, 16752762, 16774799, 9498256, 8388564, 8900346, 14204888, 16758465];
+      let randomColor = colors[Math.floor(Math.random() * colors.length)];
+      if (globals.convertColor === 'color' && color === 16777215 && color !== randomColor) {
+        colorCount++;
+        color = randomColor;
         modified = true;
       }
 
@@ -254,8 +297,17 @@ export function convertToDanmakuJson(contents, platform) {
       log("info", `[danmu convert] 转换了 ${topBottomCount} 条顶部/底部弹幕为浮动弹幕`);
     }
     if (colorCount > 0) {
-      log("info", `[danmu convert] 转换了 ${colorCount} 条彩色弹幕为纯白弹幕`);
+      log("info", `[danmu convert] 转换了 ${colorCount} 条弹幕颜色`);
     }
+  }
+
+  // 根据 danmuSimplifiedTraditional 设置转换弹幕文本
+  if (globals.danmuSimplifiedTraditional === 'traditional') {
+    convertedDanmus = convertedDanmus.map(danmu => ({
+      ...danmu,
+      m: traditionalized(danmu.m)
+    }));
+    log("info", `[danmu convert] 转换了 ${convertedDanmus.length} 条弹幕为繁体字`);
   }
 
   log("info", `danmus_original: ${danmus.length}`);
