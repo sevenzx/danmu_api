@@ -1,16 +1,17 @@
 import { Globals } from './configs/globals.js';
 import { jsonResponse } from './utils/http-util.js';
 import { log, formatLogMessage } from './utils/log-util.js'
-import { getFavoriteCachesFromRedis, getRedisCaches, judgeRedisValid } from "./utils/redis-util.js";
-import { cleanupExpiredIPs, findUrlById, getCommentCache, getLocalCaches, judgeLocalCacheValid } from "./utils/cache-util.js";
+import { getFavoriteCachesFromRedis, judgeRedisValid, initializePersistentCaches } from "./utils/redis-util.js";
+import { cleanupExpiredIPs, findUrlById, getCommentCache, judgeLocalCacheValid } from "./utils/cache-util.js";
 import { formatDanmuResponse } from "./utils/danmu-util.js";
 import AIClient from './utils/ai-util.js';
 import { getBangumi, getComment, getCommentByUrl, getSegmentComment, matchAnime, searchAnime, searchEpisodes } from "./apis/dandan-api.js";
 import { handleFavoriteAdd, handleFavoriteList, handleFavoriteRefresh, handleFavoriteRemove, handleFavoriteSchedule } from "./apis/favorite-api.js";
 import { getFongmiDanmaku } from "./apis/clients/fongmi-api.js";
-import { handleConfig, handleUI, handleLogs, handleClearLogs, handleDeploy, handleClearCache, handleReqRecords, handleCacheAnimes } from "./apis/system-api.js";
+import { handleConfig, handleUI, handleLogs, handleClearLogs, handleDeploy, handleClearCache, handleReqRecords, handleInterfaceDetail, handleCacheAnimes, handleRemoteMappingRefresh, handleRemoteAutoMatchMappingRefresh } from "./apis/system-api.js";
 import { handleForwardTrace } from "./apis/forward-trace-api.js";
-import { handleSetEnv, handleAddEnv, handleDelEnv, handleAiVerify } from "./apis/env-api.js";
+import { handleSetEnv, handleAddEnv, handleDelEnv, handleAiVerify, handleDandanplayVerify } from "./apis/env-api.js";
+import { handleLocalDanmuUpload, handleLocalDanmuList, handleLocalDanmuGet, handleLocalDanmuDelete, handleLocalDanmuUpdate } from "./apis/local-danmu-api.js";
 import { extendBangumiDownloadLifecycle } from "./utils/bangumi-data-util.js";
 import { Segment } from "./models/dandan-model.js"
 import {
@@ -20,15 +21,84 @@ import {
     handleQRCheck,
     handleCookieSave
 } from "./utils/cookie-util.js";
+import { ensureRemoteTitleMapping } from './utils/remote-title-mapping-util.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createTrace, currentTrace, finishTrace, markHandlerStart, maskTraceQueryString, runWithTrace, setTracePersistHook, traceStep, useAsyncLocalStorage } from './utils/pipeline-trace.js';
+
+// 注入异步上下文实现，使追踪状态按请求隔离
+useAsyncLocalStorage(AsyncLocalStorage);
 
 let globals;
+
+const FONGMI_DANMAKU_PATHS = new Set([
+  "/danmaku",
+  "/api/v2/fongmi/danmaku"
+]);
+
+const TITLE_MAPPING_PATHS = new Set([
+  "/api/v2/match",
+  "/api/v2/favorite/add",
+  "/api/favorite/add",
+  "/api/v2/favorite/refresh",
+  "/api/favorite/refresh",
+  "/api/v2/favorite/remove",
+  "/api/favorite/remove",
+]);
+
+// 限流检查：超过阈值时记录拦截步骤并返回 true，调用方据此返回 429；
+// 未超限则登记本次请求时间并返回 false。缓存命中的请求不进入此函数。
+function isRateLimited(clientIp) {
+  if (globals.rateLimitMaxRequests <= 0) return false;
+  const currentTime = Date.now();
+  const oneMinute = 60 * 1000;
+  cleanupExpiredIPs(currentTime);
+  if (!globals.requestHistory.has(clientIp)) globals.requestHistory.set(clientIp, []);
+  const recentRequests = globals.requestHistory.get(clientIp)
+    .filter(timestamp => currentTime - timestamp <= oneMinute);
+  if (recentRequests.length >= globals.rateLimitMaxRequests) {
+    log("warn", `[system] [Rate Limit] IP ${clientIp} exceeded rate limit (${recentRequests.length}/${globals.rateLimitMaxRequests} requests in 1 minute)`);
+    // 拦截发生在业务步骤之前，单独留痕，使详情能说明本次请求为何没有结果
+    traceStep('弹幕·限流拦截', currentTime, {
+      status: 'skip',
+      reason: `超过限流阈值（1 分钟内 ${recentRequests.length}/${globals.rateLimitMaxRequests} 次）`,
+      inputs: { 限制次数: globals.rateLimitMaxRequests, 近一分钟请求数: recentRequests.length },
+    });
+    return true;
+  }
+  recentRequests.push(currentTime);
+  globals.requestHistory.set(clientIp, recentRequests);
+  log("info", `[system] [Rate Limit] IP ${clientIp} request count: ${recentRequests.length}/${globals.rateLimitMaxRequests}`);
+  return false;
+}
+
+function isFongmiDanmakuRequest(path, method, url) {
+  if (method !== "GET" && method !== "POST") return false;
+  if (path === "/") {
+    return method === "POST" || (method === "GET" && url.searchParams.has("name"));
+  }
+  return FONGMI_DANMAKU_PATHS.has(path);
+}
+
+// 系统管理接口：必须显式携带 ADMIN_TOKEN，默认 TOKEN=87654321 的免 token 兼容不适用于这些路径
+const ADMIN_ONLY_PATH_PATTERNS = [
+  /^\/api\/env\/(?:set|add|del)\/?$/,
+  /^\/api\/deploy\/?$/,
+  /^\/api\/cache\/(?:clear|animes)\/?$/,
+  /^\/api\/logs\/clear\/?$/,
+  /^\/api\/cookie\/(?:status|save|verify|qr\/generate|qr\/check)\/?$/,
+  /^\/api\/ai\/verify\/?$/,
+  /^\/api\/nipaplay\/verify\/?$/,
+  /^\/api\/title-mapping\/refresh\/?$/,
+  /^\/api\/auto-match-mapping\/refresh\/?$/,
+];
 
 async function handleRequest(req, env, deployPlatform, clientIp) {
   // 加载全局变量和环境变量配置
   globals = Globals.init(env);
 
   const url = new URL(req.url);
-  let path = url.pathname;
+  let path = url.pathname.replace(/\/{2,}/g, "/");
+  if (path.length > 1) path = path.replace(/\/+$/, "");
   const method = req.method;
 
   globals.deployPlatform = deployPlatform;
@@ -71,7 +141,7 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
   // --- 校验 token ---
   const parts = path.split("/").filter(Boolean); // 去掉空段
 
-  const knownApiPaths = ["api", "v1", "v2", "search", "match", "favorite", "bangumi", "comment", "danmaku"];
+  const knownApiPaths = ["api", "v1", "v2", "search", "match", "favorite", "bangumi", "comment", "danmaku", "local-danmu"];
 
   const firstPart = parts[0] || "";
   const isDefaultToken = globals.token === "87654321";
@@ -89,6 +159,11 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
   // 自定义 TOKEN 时收藏接口必须显式携带 token；默认 TOKEN=87654321 时保持无 token 兼容。
   // FAVORITE_REQUIRE_ADMIN 开启后，无论 TOKEN 是否为默认值，都只能使用 ADMIN_TOKEN。
   const tokenlessPath = explicitToken ? "/" + parts.slice(1).join("/") : path;
+  const requestTrace = currentTrace();
+  if (requestTrace) {
+    requestTrace.path = tokenlessPath;
+    requestTrace.query = maskTraceQueryString(url.search);
+  }
   const isFavoriteRequest = /(?:^|\/)favorite(?:\/|$)/.test(tokenlessPath);
   const isFavoriteListRequest = method === "GET"
     && /^\/(?:api\/v2\/|api\/|v2\/)?favorite\/list$/.test(tokenlessPath);
@@ -107,19 +182,19 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
     }
   }
 
-  if (deployPlatform === "node" && globals.localCacheValid && path !== "/favicon.ico" && path !== "/robots.txt") {
-    await getLocalCaches();
-  }
-  if (globals.redisValid && path !== "/favicon.ico" && path !== "/robots.txt") {
-    await getRedisCaches();
-  }
-  // serverless 多实例下，收藏请求每次都从 Redis 刷新收藏缓存，避免读到预热实例的过期空快照
-  if (globals.redisValid && deployPlatform !== "node" && path.includes("/favorite")) {
-    await getFavoriteCachesFromRedis();
-  }
-  if (deployPlatform === "node" && globals.localRedisValid && path !== "/favicon.ico" && path !== "/robots.txt") {
-    const { getLocalRedisCaches } = await import("./utils/local-redis-util.js");
-    await getLocalRedisCaches();
+  if (path !== '/favicon.ico' && path !== '/robots.txt' && method !== 'OPTIONS') {
+    const persistentCachesReady = await initializePersistentCaches(deployPlatform);
+    let favoriteReadSucceeded = true;
+    if (globals.redisValid && deployPlatform !== 'node' && isFavoriteRequest) {
+      favoriteReadSucceeded = await getFavoriteCachesFromRedis();
+    }
+    if (isFavoriteRequest && !isFavoriteListRequest && (
+      !persistentCachesReady || !favoriteReadSucceeded || (globals.redisUrl && globals.redisToken && globals.favoriteCacheWritable.upstash === false)
+      || (globals.localCacheValid && globals.favoriteCacheWritable.file === false)
+      || (deployPlatform !== 'node' && globals.redisUrl && globals.redisToken && !globals.redisValid)
+    )) {
+      return jsonResponse({ success: false, message: '收藏缓存暂时无法读取，本次修改未执行，请稍后重试' }, 503);
+    }
   }
 
   // 检查路径是否包含指定的接口关键字
@@ -135,8 +210,8 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
     '/api/v2/segmentcomment'
   ];
 
-  // 只有当path包含指定接口关键字时才添加到请求记录数组
-  if (targetPaths.some(targetPath => path.includes(targetPath))) {
+  // 识别 FongMi 根地址或指定业务接口，记录请求历史和今日请求数。
+  if (isFongmiDanmakuRequest(tokenlessPath, method, url) || targetPaths.some(targetPath => path.includes(targetPath))) {
     // 更新今日请求计数
     // 从 reqRecords 最后一个元素获取上一个请求的时间
     const lastRecord = globals.reqRecords.length > 0 ? globals.reqRecords[globals.reqRecords.length - 1] : null;
@@ -188,6 +263,7 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
 
     // 记录请求历史，包括接口/参数/请求时间
     const requestRecord = {
+      requestId: currentTrace()?.id ?? null,
       interface: normalizedPath,
       params: requestBody, // 请求体JSON
       timestamp: new Date().toISOString(), // 请求时间
@@ -204,7 +280,7 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
   }
 
   // GET /
-  if (path === "/" && method === "GET") {
+  if (path === "/" && method === "GET" && !isFongmiDanmakuRequest(path, method, url)) {
     return handleUI();
   }
 
@@ -262,6 +338,21 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
     }
   }
 
+  // 系统管理接口鉴权：只看请求实际携带的 token（explicitToken），避免默认 token 兼容垫片被用来自我授权
+  if (ADMIN_ONLY_PATH_PATTERNS.some((pattern) => pattern.test(path))) {
+    const isAdminRequest = Boolean(globals.adminToken) && explicitToken === globals.adminToken;
+    if (!isAdminRequest) {
+      const errorMessage = globals.adminToken
+        ? "Unauthorized: 系统管理接口需要 ADMIN_TOKEN"
+        : "Unauthorized: 系统管理接口需要先设置 ADMIN_TOKEN";
+      log("warn", `[system] [server] Admin-only endpoint denied: ${path} - ${errorMessage}`);
+      return jsonResponse({ errorCode: 401, success: false, errorMessage }, 401);
+    }
+  }
+
+  const prepareTrace = currentTrace();
+  if (prepareTrace) markHandlerStart(prepareTrace.startedAt);
+
   // 兼容部分客户端将自定义弹幕短地址再次拼接官方完整路径的情况
   // 例如: /danmaku/api/v2/fongmi/danmaku?name=...&episode=...
   if (path.endsWith("/danmaku/api/v2/fongmi/danmaku")) {
@@ -274,9 +365,33 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
     return handleConfig(true); // 有权限
   }
 
+  const isLocalDanmuUpload = (path === '/api/local-danmu/upload' || path === '/api/v2/local-danmu/upload') && method === 'POST';
+  const isLocalDanmuList = (path === '/api/local-danmu/list' || path === '/api/v2/local-danmu/list') && method === 'GET';
+  const localResourceMatch = path.match(/^\/api(?:\/v2)?\/local-danmu\/([^/]+)$/);
+  if (isLocalDanmuUpload || isLocalDanmuList || (localResourceMatch && (method === 'GET' || method === 'DELETE' || method === 'PATCH'))) {
+    const isAdmin = !!globals.adminToken && globals.currentToken === globals.adminToken;
+    const isUser = !!globals.token && globals.currentToken === globals.token;
+    if (!isAdmin && !isUser) return jsonResponse({ errorCode: 401, success: false, errorMessage: 'Unauthorized' }, 401);
+    if ((isLocalDanmuUpload || method === 'DELETE' || method === 'PATCH') && !isAdmin && !globals.localDanmuNotRequireAdmin) {
+      return jsonResponse({ errorCode: 403, success: false, errorMessage: 'Local danmu upload and deletion require ADMIN_TOKEN or LOCAL_DANMU_NOT_REQUIRE_ADMIN=true' }, 403);
+    }
+    if (isLocalDanmuUpload) return handleLocalDanmuUpload(req);
+    if (isLocalDanmuList) return handleLocalDanmuList();
+    const key = decodeURIComponent(localResourceMatch[1]);
+    if (method === 'GET') return handleLocalDanmuGet(key);
+    if (method === 'PATCH') return handleLocalDanmuUpdate(req, key);
+    return handleLocalDanmuDelete(key);
+  }
+
   // GET /api/reqrecords - 获取请求记录 (需要 token)
   if (path === "/api/reqrecords" && method === "GET") {
     return handleReqRecords();
+  }
+
+  // GET /api/interface-detail/:id - 获取单条请求的处理详情（接口详情）
+  const interfaceDetailMatch = path.match(/^\/api\/interface-detail\/([^/]+)\/?$/);
+  if (interfaceDetailMatch && method === 'GET') {
+    return handleInterfaceDetail(interfaceDetailMatch[1]);
   }
 
   log("info", `[system] [server] ${path}`);
@@ -286,7 +401,10 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
     && !path.startsWith('/api/deploy') && !path.startsWith('/api/cache')
     && !path.startsWith('/api/cookie') && !path.startsWith('/api/config')
     && !path.startsWith('/api/favorite')
-    && !path.startsWith('/api/ai') && !path.startsWith('/api/debug')) {
+    && !path.startsWith('/api/ai') && !path.startsWith('/api/nipaplay')
+    && !path.startsWith('/api/debug') && !path.startsWith('/api/title-mapping')
+    && !path.startsWith('/api/auto-match-mapping')
+    && !path.startsWith('/api/local-danmu')) {
       log("info", `[system] [path check] Starting path normalization for: "${path}"`);
       const pathBeforeCleanup = path; // 保存清理前的路径检查是否修改
 
@@ -311,7 +429,10 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
         && !path.startsWith('/api/env') && !path.startsWith('/api/cache')
         && !path.startsWith('/api/cookie') && !path.startsWith('/api/config')
         && !path.startsWith('/api/favorite')
-        && !path.startsWith('/api/ai') && !path.startsWith('/api/debug')) {
+        && !path.startsWith('/api/ai') && !path.startsWith('/api/nipaplay')
+        && !path.startsWith('/api/debug') && !path.startsWith('/api/title-mapping')
+        && !path.startsWith('/api/auto-match-mapping')
+        && !path.startsWith('/api/local-danmu')) {
           if (path.startsWith('/v2/') || path === '/v2') {
               log("info", `[system] [path check] Path is missing /api prefix. Adding /api...`);
               path = '/api' + path;
@@ -333,9 +454,13 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
   }
 
   // GET /
-  if (path === "/" && method === "GET") {
+  if (path === "/" && method === "GET" && !isFongmiDanmakuRequest(path, method, url)) {
     return handleUI();
   }
+
+  const needsTitleMapping = isFongmiDanmakuRequest(path, method, url)
+    || TITLE_MAPPING_PATHS.has(path);
+  if (needsTitleMapping) await ensureRemoteTitleMapping();
 
   // GET /api/v2/search/anime
   if (path === "/api/v2/search/anime" && method === "GET") {
@@ -347,13 +472,8 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
     return searchEpisodes(url);
   }
 
-  // GET|POST /api/v2/fongmi/danmaku
-  if (path === "/api/v2/fongmi/danmaku" && (method === "GET" || method === "POST")) {
-    return getFongmiDanmaku(url, req);
-  }
-
-  // GET|POST /danmaku
-  if (path === "/danmaku" && (method === "GET" || method === "POST")) {
+  // GET|POST /、/danmaku 或 /api/v2/fongmi/danmaku
+  if (isFongmiDanmakuRequest(path, method, url)) {
     return getFongmiDanmaku(url, req);
   }
 
@@ -415,35 +535,12 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
         return getCommentByUrl(videoUrl, queryFormat, segmentFlag, includeDuration);
       }
 
-      // 缓存未命中，执行限流检查（如果 rateLimitMaxRequests > 0 则启用限流）
-      if (globals.rateLimitMaxRequests > 0) {
-        const currentTime = Date.now();
-        const oneMinute = 60 * 1000;
-
-        // 清理所有过期的 IP 记录
-        cleanupExpiredIPs(currentTime);
-
-        // 检查该 IP 地址的历史请求
-        if (!globals.requestHistory.has(clientIp)) {
-          globals.requestHistory.set(clientIp, []);
-        }
-
-        const history = globals.requestHistory.get(clientIp);
-        const recentRequests = history.filter(timestamp => currentTime - timestamp <= oneMinute);
-
-        // 如果最近 1 分钟内的请求次数超过限制，返回 429 错误
-        if (recentRequests.length >= globals.rateLimitMaxRequests) {
-          log("warn", `[system] [Rate Limit] IP ${clientIp} exceeded rate limit (${recentRequests.length}/${globals.rateLimitMaxRequests} requests in 1 minute)`);
-          return jsonResponse(
-            { errorCode: 429, success: false, errorMessage: "Too many requests, please try again later" },
-            429
-          );
-        }
-
-        // 记录本次请求时间戳
-        recentRequests.push(currentTime);
-        globals.requestHistory.set(clientIp, recentRequests);
-        log("info", `[system] [Rate Limit] IP ${clientIp} request count: ${recentRequests.length}/${globals.rateLimitMaxRequests}`);
+      // 缓存未命中，执行限流检查
+      if (isRateLimited(clientIp)) {
+        return jsonResponse(
+          { errorCode: 429, success: false, errorMessage: "Too many requests, please try again later" },
+          429
+        );
       }
 
       // 通过URL获取弹幕
@@ -471,39 +568,12 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
       }
     }
 
-    // 缓存未命中，执行限流检查（如果 rateLimitMaxRequests > 0 则启用限流）
-    if (globals.rateLimitMaxRequests > 0) {
-      // 获取当前时间戳（单位：毫秒）
-      const currentTime = Date.now();
-      const oneMinute = 60 * 1000;  // 1分钟 = 60000 毫秒
-
-      // 清理所有过期的 IP 记录
-      cleanupExpiredIPs(currentTime);
-
-      // 检查该 IP 地址的历史请求
-      if (!globals.requestHistory.has(clientIp)) {
-        // 如果该 IP 地址没有请求历史，初始化一个空队列
-        globals.requestHistory.set(clientIp, []);
-      }
-
-      const history = globals.requestHistory.get(clientIp);
-
-      // 过滤掉已经超出 1 分钟的请求
-      const recentRequests = history.filter(timestamp => currentTime - timestamp <= oneMinute);
-
-      // 如果最近的请求数量大于等于配置的限制次数，则限制请求
-      if (recentRequests.length >= globals.rateLimitMaxRequests) {
-        log("warn", `[system] [Rate Limit] IP ${clientIp} exceeded rate limit (${recentRequests.length}/${globals.rateLimitMaxRequests} requests in 1 minute)`);
-        return jsonResponse(
-          { errorCode: 429, success: false, errorMessage: "Too many requests, please try again later" },
-          429
-        );
-      }
-
-      // 记录本次请求时间戳
-      recentRequests.push(currentTime);
-      globals.requestHistory.set(clientIp, recentRequests);
-      log("info", `[system] [Rate Limit] IP ${clientIp} request count: ${recentRequests.length}/${globals.rateLimitMaxRequests}`);
+    // 缓存未命中，执行限流检查
+    if (isRateLimited(clientIp)) {
+      return jsonResponse(
+        { errorCode: 429, success: false, errorMessage: "Too many requests, please try again later" },
+        429
+      );
     }
 
     return getComment(path, queryFormat, segmentFlag, clientIp, includeDuration);
@@ -542,6 +612,16 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
   // GET /api/logs
   if (path === "/api/logs" && method === "GET") {
     return handleLogs();
+  }
+
+  // POST /api/title-mapping/refresh - 管理员手动刷新远程映射表
+  if (path === "/api/title-mapping/refresh" && method === "POST") {
+    return handleRemoteMappingRefresh();
+  }
+
+  // POST /api/auto-match-mapping/refresh - 管理员手动刷新远程季集映射表
+  if (path === "/api/auto-match-mapping/refresh" && method === "POST") {
+    return handleRemoteAutoMatchMappingRefresh();
   }
 
   if (path === '/api/debug/forward-trace') {
@@ -618,6 +698,11 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
   // POST /api/ai/verify - 验证AI连通性
   if (path === "/api/ai/verify" && method === "POST") {
     return handleAiVerify(req);
+  }
+
+  // POST /api/nipaplay/verify - 验证弹弹play账号连通性
+  if (path === "/api/nipaplay/verify" && method === "POST") {
+    return handleDandanplayVerify(req);
   }
 
   return jsonResponse({ message: "Not found" }, 404);
@@ -741,13 +826,107 @@ function detectDeployPlatform(env) {
   return isRunningOnVercel() ? "vercel" : "cloudflare";
 }
 
+// 请求记录与详情必须同批落盘，避免重启后出现有详情但无请求记录；失败不影响请求结果
+const REQUEST_RECORD_PERSIST_KEYS = { keys: ['reqRecords', 'todayReqNum', 'pipelineTraces'] };
+let tracePersistTimer = null;
+let tracePersistPromise = null;
+let tracePersistRequested = false;
+
+async function persistRequestSnapshot() {
+  const backends = [
+    ['file', globals.localCacheValid, './utils/cache-util.js', 'updateLocalCaches'],
+    ['upstash', globals.redisValid, './utils/redis-util.js', 'updateRedisCaches'],
+    ['localRedis', globals.localRedisValid, './utils/local-redis-util.js', 'updateLocalRedisCaches'],
+  ];
+  for (const [backend, enabled, modulePath, method] of backends) {
+    if (!enabled) continue;
+    try {
+      const module = await import(modulePath);
+      const result = await module[method](REQUEST_RECORD_PERSIST_KEYS);
+      if (result === false) log('warn', `[system] [trace] ${backend} 详情落盘未执行`);
+    } catch (error) {
+      log('warn', `[system] [trace] ${backend} 详情落盘失败: ${error.message}`);
+    }
+  }
+}
+
+function startTracePersist() {
+  if (tracePersistPromise) return tracePersistPromise;
+  tracePersistPromise = (async () => {
+    try {
+      while (tracePersistRequested) {
+        tracePersistRequested = false;
+        await persistRequestSnapshot();
+      }
+    } finally {
+      tracePersistPromise = null;
+    }
+  })();
+  return tracePersistPromise;
+}
+
+function scheduleTracePersist() {
+  // 合并短时间内的多次落盘，写穿仍保持与请求记录同批可见
+  tracePersistRequested = true;
+  if (tracePersistTimer || tracePersistPromise) return;
+  tracePersistTimer = setTimeout(() => {
+    tracePersistTimer = null;
+    startTracePersist().catch(error => log('warn', `[system] [trace] 详情落盘失败: ${error.message}`));
+  }, 500);
+}
+
+function flushTracePersistence() {
+  if (tracePersistTimer) {
+    clearTimeout(tracePersistTimer);
+    tracePersistTimer = null;
+  }
+  tracePersistRequested = true;
+  return startTracePersist();
+}
+
+const SERVERLESS_PLATFORMS = new Set(['cloudflare', 'vercel', 'netlify', 'edgeone']);
+
+// 在追踪作用域内处理一次请求，结束时留存该请求的接口详情
+export async function handleRequestWithTrace(req, env, deployPlatform, clientIp, lifecycleContext) {
+  // 接口路径由 handleRequest 写入不含凭据的路径，此处不记录 URL 中可能携带的 token
+  const trace = createTrace(req.method, '', clientIp);
+  let retained = false;
+  return runWithTrace(trace, async () => {
+    try {
+      const response = await handleRequest(req, env, deployPlatform, clientIp);
+      trace.statusCode = response?.status ?? null;
+      // 列表据此直接区分成败，不必逐条打开详情
+      const record = globals.reqRecords.find(item => item.requestId === trace.id);
+      if (record) record.statusCode = trace.statusCode;
+      return response;
+    } finally {
+      // 只有写入请求记录的请求才留存详情，两者一一对应
+      retained = globals.reqRecords.some(record => record.requestId === trace.id);
+      finishTrace(trace, retained);
+      // 异常同样要落盘；边缘/Serverless 可能在响应后冻结 timer，优先注册 waitUntil
+      if (retained && SERVERLESS_PLATFORMS.has(deployPlatform)) {
+        const pending = flushTracePersistence();
+        if (typeof lifecycleContext?.waitUntil === 'function') lifecycleContext.waitUntil(pending);
+        else await pending;
+      }
+    }
+  });
+}
+
+// 详情随请求记录同批落盘；模块加载时注册一次
+function initTracePersistence() {
+  setTracePersistHook(scheduleTracePersist);
+}
+
+initTracePersistence();
+
 // --- Cloudflare Workers 入口 ---
 export default {
   async fetch(request, env, ctx) {
     // 获取客户端的真实 IP
     const clientIp = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || 'unknown';
 
-    const response = await handleRequest(request, env, detectDeployPlatform(env), clientIp);
+    const response = await handleRequestWithTrace(request, env, detectDeployPlatform(env), clientIp, ctx);
     // 边缘运行时在响应返回后延长生命周期，容纳可能在途的 Bangumi Data 后台静默下载
     extendBangumiDownloadLifecycle(ctx);
     return response;
@@ -768,7 +947,7 @@ export async function vercelHandler(req, res) {
         : undefined,
   });
 
-  const response = await handleRequest(cfReq, process.env, "vercel", clientIp);
+  const response = await handleRequestWithTrace(cfReq, process.env, "vercel", clientIp);
 
   res.status(response.status);
   response.headers.forEach((value, key) => res.setHeader(key, value));
@@ -794,7 +973,7 @@ export async function netlifyHandler(event, context) {
   });
 
   // 调用核心处理函数
-  const response = await handleRequest(request, process.env, "netlify", clientIp);
+  const response = await handleRequestWithTrace(request, process.env, "netlify", clientIp, context);
 
   // 转换为 Netlify 响应格式
   const headers = {};

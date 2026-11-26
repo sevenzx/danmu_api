@@ -1,9 +1,13 @@
-import { globals } from "../configs/globals.js";
+import { Globals, globals } from "../configs/globals.js";
+import { getEpisodeIdFloor, queryCacheKeys } from "../utils/cache-util.js";
 import { jsonResponse } from "../utils/http-util.js";
 import { HTML_TEMPLATE } from "../ui/template.js";
 import { formatLogMessage, log } from "../utils/log-util.js";
+import { refreshRemoteTitleMappingNow } from "../utils/remote-title-mapping-util.js";
+import { refreshRemoteAutoMatchMappingNow } from "../utils/auto-match-mapping-url-util.js";
 import { HandlerFactory } from "../configs/handlers/handler-factory.js";
 import { clearBangumiDataCache, initBangumiData } from "../utils/bangumi-data-util.js";
+import { buildResultDiagnosis, clearTraceRecords, describeConfigValue, getInterfaceDetail, TRACE_CONFIG_ACCESSORS, TRACE_RUNTIME_ACCESSORS } from "../utils/pipeline-trace.js";
 
 const UI_THEMES = new Set([
   'lavender', 'shinyo', 'sakura', 'tianyi', 'hatsune', 'sakuragi', 'violet', 'amber'
@@ -15,9 +19,14 @@ function resolveUiTheme(theme) {
 }
 
 export function handleUI() {
+  const localDanmuCanUpload = globals.localDanmuNotRequireAdmin
+    || (!!globals.adminToken && globals.currentToken === globals.adminToken);
   const html = HTML_TEMPLATE
     .replace("globals.currentToken", () => globals.currentToken)
-    .replace("globals.uiTheme", resolveUiTheme(globals.uiTheme));
+    .replace("globals.uiTheme", resolveUiTheme(globals.uiTheme))
+    .replace("globals.localDanmuCanUpload", String(localDanmuCanUpload))
+    .replace("globals.localDanmuRedisValid", String(globals.redisValid === true))
+    .replace("globals.localDanmuIsCloud", String(Boolean(globals.deployPlatform && globals.deployPlatform.toLowerCase() !== 'node')));
 
   return new Response(html, {
     headers: {
@@ -158,6 +167,20 @@ export function handleLogs() {
   return new Response(processedLogText, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
 }
 
+/** 管理员手动刷新远程映射表 */
+export async function handleRemoteMappingRefresh() {
+  const result = await refreshRemoteTitleMappingNow();
+  const { status, ...body } = result;
+  return jsonResponse(body, status);
+}
+
+/** 管理员手动刷新远程季集映射表 */
+export async function handleRemoteAutoMatchMappingRefresh() {
+  const result = await refreshRemoteAutoMatchMappingNow();
+  const { status, ...body } = result;
+  return jsonResponse(body, status);
+}
+
 /**
  * 处理清除日志的请求
  * @returns {Response} 表示操作成功的响应
@@ -177,7 +200,7 @@ export async function handleClearCache(req) {
   const clearActions = {
     animes: () => { globals.animes = []; },
     episodeIds: () => { globals.episodeIds = []; },
-    episodeNum: () => { globals.episodeNum = 10001; }, // 重置为初始值
+    episodeNum: () => {}, // 在所有选中项清理完毕后，按剩余引用重置
     lastSelectMap: () => { globals.lastSelectMap = new Map(); }, // 重新创建 Map 对象
     // 清理搜索和弹幕缓存
     searchCache: () => { globals.searchCache = new Map(); },
@@ -186,6 +209,7 @@ export async function handleClearCache(req) {
       globals.requestHistory = new Map();
       globals.reqRecords = []; // 清空请求记录
       globals.todayReqNum = 0; // 重置今日请求次数
+      clearTraceRecords(); // 详情记录与请求记录同源，一并清空
     },
     bangumiData: () => {
       try {
@@ -223,40 +247,36 @@ export async function handleClearCache(req) {
       clearActions[key]();
     }
 
+    if (effectiveItems.includes('episodeNum')) globals.episodeNum = getEpisodeIdFloor();
     log("info", `[system] [server] Memory cache cleared successfully`);
 
-    // 同步清理本地缓存和Redis缓存
-    try {
-      // 如果本地缓存有效，更新本地缓存
-      if (globals.localCacheValid) {
-        const { updateLocalCaches } = await import("../utils/cache-util.js");
-        await updateLocalCaches();
-        log("info", `[system] [server] Local cache cleared successfully`);
+    // 显式清理仅写选中键，不携带默认收藏或未读取的其他查询数据。
+    const keys = queryCacheKeys.filter(key => effectiveItems.includes(key)
+      || (effectiveItems.includes('requestHistory') && ['reqRecords', 'todayReqNum', 'pipelineTraces'].includes(key)));
+    const failedBackends = [];
+    const restartBackends = [];
+    if (keys.length) {
+      const targets = [
+        ['file', globals.localCacheValid && globals.localCacheEnabled !== false, async () => (await import('../utils/cache-util.js')).updateLocalCaches({ keys, force: true })],
+        ['upstash', globals.redisUrl && globals.redisToken, async () => (await import('../utils/redis-util.js')).updateRedisCaches({ keys, force: true, timeoutMs: 5000 })],
+        ['localRedis', globals.deployPlatform === 'node' && globals.localRedisUrl, async () => (await import('../utils/local-redis-util.js')).updateLocalRedisCaches({ keys, force: true, timeoutMs: 5000 })]
+      ];
+      // 各后端独立清理，网络等待不串行累加；按固定顺序汇总部分失败。
+      const results = await Promise.allSettled(targets.map(([, enabled, update]) => enabled ? update() : true));
+      for (const [index, [backend, enabled]] of targets.entries()) {
+        if (!enabled) continue;
+        try {
+          const result = results[index];
+          if (result.status === 'rejected') throw result.reason;
+          if (!result.value) throw new Error('保存未成功');
+          // 只有完整清除查询快照才可直接解除保护；部分清除后需重启重读剩余键。
+          if (keys.length === queryCacheKeys.length) globals.queryCacheWritable[backend] = true;
+          else if (globals.queryCacheWritable[backend] === false) restartBackends.push(backend);
+        } catch (error) {
+          failedBackends.push(backend);
+          log('warn', `[system] ${backend} 缓存清理保存失败: ${error.message}`);
+        }
       }
-    } catch (localError) {
-      log("warn", `[system] [server] Local cache may not be available: ${localError.message}`);
-    }
-
-    try {
-      // 如果Redis有效，更新Redis缓存
-      if (globals.redisValid) {
-        const { updateRedisCaches } = await import("../utils/redis-util.js");
-        await updateRedisCaches();
-        log("info", `[system] [server] Redis cache cleared successfully`);
-      }
-    } catch (redisError) {
-      log("warn", `[system] [server] Redis may not be available: ${redisError.message}`);
-    }
-
-    try {
-      // 如果本地Redis有效，更新本地Redis缓存
-      if (globals.localRedisValid) {
-        const { updateLocalRedisCaches } = await import("../utils/local-redis-util.js");
-        await updateLocalRedisCaches();
-        log("info", `[system] [server] LocalRedis cache cleared successfully`);
-      }
-    } catch (redisError) {
-      log("warn", `[system] [server] LocalRedis may not be available: ${redisError.message}`);
     }
 
     const clearedItems = {};
@@ -265,19 +285,36 @@ export async function handleClearCache(req) {
         clearedItems.requestHistory = 0;
         clearedItems.reqRecords = 0;
         clearedItems.todayReqNum = 0;
+        clearedItems.pipelineTraces = 0;
       } else if (key === "episodeNum") {
-        clearedItems.episodeNum = 10001;
+        clearedItems.episodeNum = globals.episodeNum;
       } else {
         clearedItems[key] = 0;
       }
     }
 
-    log("info", `[system] [server] Selected caches cleared successfully`);
-    return jsonResponse({ success: true, message: "Cache cleared successfully", clearedItems }, 200);
+    if (failedBackends.length) {
+      return jsonResponse({ success: false, message: `内存已清理，但 ${failedBackends.join(', ')} 保存失败；未保存的后端仍保留清理前数据，重启后会重新加载，请重试`, clearedItems, failedBackends }, 500);
+    }
+    const message = restartBackends.length
+      ? `选中项已清理；${restartBackends.join(', ')} 仍保护未恢复的其他缓存，重启后重新读取，或清理全部查询缓存解除保护`
+      : 'Cache cleared successfully';
+    log('info', `[system] ${message}`);
+    return jsonResponse({ success: true, message, clearedItems, restartRequired: restartBackends.length > 0 }, 200);
   } catch (error) {
     log("error", `[system] [server] Cache clear failed: ${error.message}`);
     return jsonResponse({ success: false, message: `Cache clear failed: ${error.message}` }, 500);
   }
+}
+
+// 判断当前请求是否携带 ADMIN_TOKEN；未配置 ADMIN_TOKEN 时不得把无 token 请求当作 admin
+function hasAdminToken() {
+  return !!globals.adminToken && globals.currentToken === globals.adminToken;
+}
+
+// 隐藏客户端 IP 中除 . 外的字符，保留 IP 结构
+function maskClientIp(clientIp) {
+  return typeof clientIp === 'string' ? clientIp.replace(/[^.]/g, '*') : clientIp;
 }
 
 // 隐藏接口 URL 查询串中的参数值，保留路径与参数名（key=value -> key=***）
@@ -291,16 +328,82 @@ function maskInterfaceValues(interfaceStr) {
   return `${path}?${maskedQuery}`;
 }
 
-// 递归隐藏请求体的所有叶子值，保留 key 与数组/对象结构
-function maskParamValues(value) {
+// 步骤取值脱敏：数量与布尔不泄露内容可保留，ID 与文本一律打码
+// ID 类字段能反推用户请求的具体条目，按字段名识别而非按类型
+function maskStepValues(value, key) {
   if (value === null || value === undefined) return value;
-  if (Array.isArray(value)) return value.map(maskParamValues);
+  if (Array.isArray(value)) return value.map(item => maskStepValues(item, key));
   if (typeof value === 'object') {
     const out = {};
-    for (const key of Object.keys(value)) out[key] = maskParamValues(value[key]);
+    for (const name of Object.keys(value)) out[name] = maskStepValues(value[name], name);
     return out;
   }
-  return '***'; // 字符串/数字/布尔等叶子值统一脱敏
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return /[Ii][Dd]$/.test(key || '') ? '***' : value;
+  return '***';
+}
+
+// 递归隐藏叶子值并保留 key 与数组/对象结构；叶子策略区分请求参数与取值明细
+function maskLeaves(value, maskLeaf) {
+  if (value === null || value === undefined) return value;
+  if (Array.isArray(value)) return value.map(item => maskLeaves(item, maskLeaf));
+  if (typeof value === 'object') {
+    const out = {};
+    for (const key of Object.keys(value)) out[key] = maskLeaves(value[key], maskLeaf);
+    return out;
+  }
+  return maskLeaf(value);
+}
+
+// 请求参数的所有叶子值统一脱敏
+function maskParamValues(value) {
+  return maskLeaves(value, () => '***');
+}
+
+// 取值明细只隐藏文本，保留计数与布尔标记
+function maskChangeValues(value) {
+  return maskLeaves(value, leaf => typeof leaf === 'string' ? '***' : leaf);
+}
+
+// 表格只隐藏单元格文本，保留列名与数值，使非管理员仍能看到结构
+function maskTable(table) {
+  if (!table || !Array.isArray(table.rows)) return table;
+  return { ...table, rows: maskChangeValues(table.rows) };
+}
+
+// 请求者信息在请求记录与接口详情中按同一规则脱敏
+function maskRequesterFields(record) {
+  const masked = { ...record };
+  if (masked.clientIp) masked.clientIp = maskClientIp(masked.clientIp);
+  if (typeof masked.interface === 'string') masked.interface = maskInterfaceValues(masked.interface);
+  for (const key of ['path', 'query']) {
+    if (typeof masked[key] === 'string') masked[key] = maskInterfaceValues(masked[key]);
+  }
+  return masked;
+}
+
+// 隐藏追踪记录中的请求者信息与步骤数据，保留字段结构和配置覆盖取值
+function maskTraceForNonAdmin(trace) {
+  const steps = trace.steps.map(step => {
+    const masked = { ...step };
+    if (masked.inputs !== undefined) masked.inputs = maskStepValues(masked.inputs);
+    if (masked.outputs !== undefined) masked.outputs = maskStepValues(masked.outputs);
+    if (masked.error !== undefined) masked.error = maskStepValues(masked.error);
+    if (masked.table !== undefined) masked.table = maskTable(masked.table);
+    if (masked.changes !== undefined) {
+      masked.changes = masked.changes.map(change => ({
+        ...change,
+        context: maskChangeValues(change.context),
+        before: maskChangeValues(change.before),
+        after: maskChangeValues(change.after),
+        kept: maskChangeValues(change.kept),
+        removed: maskChangeValues(change.removed),
+        table: maskTable(change.table),
+      }));
+    }
+    return masked;
+  });
+  return { ...maskRequesterFields(trace), steps };
 }
 
 /**
@@ -313,26 +416,83 @@ export function handleReqRecords() {
   const todayReqNum = globals.todayReqNum || 0;
   
   // 非 admin token 时，对请求记录脱敏：IP / 接口查询值 / 请求体值
-  if (globals.currentToken !== globals.adminToken) {
+  if (!hasAdminToken()) {
     records = records.map(record => {
-      const masked = { ...record };
-      if (masked.clientIp) {
-        // 沿用既有规则：IP 中除 . 外每个字符替换为 *
-        masked.clientIp = masked.clientIp.replace(/[^.]/g, '*');
-      }
-      if (typeof masked.interface === 'string') {
-        // 隐藏接口查询串的值，保留路径与参数名
-        masked.interface = maskInterfaceValues(masked.interface);
-      }
-      if (masked.params != null) {
-        // 隐藏请求体的所有值，保留 key 与结构
-        masked.params = maskParamValues(masked.params);
-      }
+      const masked = maskRequesterFields(record);
+      if (masked.params != null) masked.params = maskParamValues(masked.params);
       return masked;
     });
   }
   
   return jsonResponse({ records, todayReqNum }, 200);
+}
+
+// 从步骤的候选数变化定位结果归零的位置，供弹窗直接给出排查结论
+// 归零指候选数量由正数转为 0，且其后各步骤的候选数保持为 0；缓存未命中等瞬时 0 不计入
+/**
+ * 处理获取单条请求处理详情（接口详情）的请求
+ * @param {string} id 追踪记录 id
+ * @returns {Response} 包含该请求阶段耗时、全部配置覆盖、结果诊断与处理流水的 JSON 响应
+ */
+// 取配置当前取值：环境变量直接读 envs，运行态读类字段，两者都不经代理登记读取
+function currentConfigValue(accessor) {
+  const envs = Globals.envs || {};
+  return accessor in envs ? envs[accessor] : Globals[accessor];
+}
+
+// 追踪记录里没有的配置按目录补齐为未读取，取值取当前配置
+function describeTraceConfig(recorded, accessor) {
+  return {
+    value: recorded?.value ?? describeConfigValue(accessor, currentConfigValue(accessor)),
+    used: recorded?.used ?? false,
+    hit: recorded?.hit,
+    step: recorded?.step ?? null,
+    effectStep: recorded?.effectStep ?? null,
+  };
+}
+
+export function handleInterfaceDetail(id) {
+  const trace = getInterfaceDetail(id);
+  if (!trace) {
+    return jsonResponse({ success: false, errorCode: 404, errorMessage: '未找到该请求的接口详情' }, 404);
+  }
+  // 全部配置项按 envVarConfig 的分类与描述整理，运行态归入「运行环境」
+  const envVarConfig = globals.envVarConfig || {};
+  const configs = [
+    ...Object.keys(TRACE_CONFIG_ACCESSORS).map(upName => {
+      const accessor = TRACE_CONFIG_ACCESSORS[upName];
+      const meta = envVarConfig[upName] || {};
+      return {
+        name: upName,
+        accessor,
+        category: meta.category || 'system',
+        description: meta.description || '',
+        ...describeTraceConfig(trace.configs[accessor], accessor),
+      };
+    }),
+    ...Object.keys(TRACE_RUNTIME_ACCESSORS).map(name => {
+      const accessor = TRACE_RUNTIME_ACCESSORS[name];
+      return {
+        name,
+        accessor,
+        category: 'runtime',
+        description: '请求结束时的运行态，不属于环境变量配置',
+        ...describeTraceConfig(trace.configs[accessor], accessor),
+      };
+    }),
+  ];
+  const detail = hasAdminToken() ? trace : maskTraceForNonAdmin(trace);
+  // startedAt 与 finished 为入口计时与结束标记，不进入详情；其余追踪字段与配置覆盖一并透传
+  const { startedAt, finished, ...publicTrace } = detail;
+  return jsonResponse({
+    trace: {
+      ...publicTrace,
+      query: publicTrace.query || '',
+      configs,
+      // 用已脱敏的步骤计算结论：管理员即原始数据，普通用户不会从结论中反推文本取值
+      diagnosis: buildResultDiagnosis(detail.steps),
+    },
+  }, 200);
 }
 
 /**
